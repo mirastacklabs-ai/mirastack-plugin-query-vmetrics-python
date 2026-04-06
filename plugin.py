@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
+import os
 
 from mirastack_sdk import (
+    ConfigParam,
     Plugin,
     PluginInfo,
     PluginSchema,
-    SchemaParam,
-    EngineContext,
+    ParamSchema,
     Permission,
     DevOpsStage,
-    ExecutionRequest,
-    ExecutionResponse,
+    ExecuteRequest,
+    ExecuteResponse,
     serve,
 )
+from mirastack_sdk.datetimeutils import format_epoch_seconds
+from mirastack_sdk.plugin import TimeRange
 from metrics_client import MetricsClient
 
 
@@ -25,65 +27,86 @@ class QueryMetricsPlugin(Plugin):
 
     def __init__(self):
         self._client: MetricsClient | None = None
+        # Bootstrap from env var; engine pushes runtime config via config_updated()
+        url = os.environ.get("MIRASTACK_METRICS_URL", "")
+        if url:
+            self._client = MetricsClient(url)
 
     def info(self) -> PluginInfo:
         return PluginInfo(
             name="query_metrics",
             version="0.1.0",
             description="Query Prometheus/VictoriaMetrics for metrics data",
-            permission=Permission.READ,
+            permissions=[Permission.READ],
             devops_stages=[DevOpsStage.OBSERVE],
+            config_params=[
+                ConfigParam(key="metrics_url", type="string", required=True, description="VictoriaMetrics base URL (e.g. http://victoriametrics:8428)"),
+            ],
         )
 
     def schema(self) -> PluginSchema:
         return PluginSchema(
-            params=[
-                SchemaParam(name="action", type="string", required=True,
-                           description="One of: instant_query, range_query, label_names, label_values, series, metadata"),
-                SchemaParam(name="query", type="string", required=False,
-                           description="PromQL query expression"),
-                SchemaParam(name="start", type="string", required=False,
-                           description="Start time (RFC3339 or relative like -1h)"),
-                SchemaParam(name="end", type="string", required=False,
-                           description="End time (RFC3339 or relative like now)"),
-                SchemaParam(name="step", type="string", required=False,
-                           description="Query step (e.g., 15s, 1m)"),
-                SchemaParam(name="label", type="string", required=False,
-                           description="Label name for label_values action"),
-                SchemaParam(name="match", type="string", required=False,
-                           description="Series selector for series action"),
-                SchemaParam(name="metric", type="string", required=False,
-                           description="Metric name for metadata action"),
+            input_params=[
+                ParamSchema(name="action", type="string", required=True,
+                            description="One of: instant_query, range_query, label_names, label_values, series, metadata"),
+                ParamSchema(name="query", type="string", required=False,
+                            description="PromQL query expression"),
+                ParamSchema(name="start", type="string", required=False,
+                            description="Start time (RFC3339 or relative like -1h)"),
+                ParamSchema(name="end", type="string", required=False,
+                            description="End time (RFC3339 or relative like now)"),
+                ParamSchema(name="step", type="string", required=False,
+                            description="Query step (e.g., 15s, 1m)"),
+                ParamSchema(name="label", type="string", required=False,
+                            description="Label name for label_values action"),
+                ParamSchema(name="match", type="string", required=False,
+                            description="Series selector for series action"),
+                ParamSchema(name="metric", type="string", required=False,
+                            description="Metric name for metadata action"),
+            ],
+            output_params=[
+                ParamSchema(name="result", type="json", required=True,
+                            description="Query result as JSON"),
             ],
         )
 
-    async def execute(self, ctx: EngineContext, req: ExecutionRequest) -> ExecutionResponse:
+    async def execute(self, req: ExecuteRequest) -> ExecuteResponse:
         if self._client is None:
-            config = await ctx.get_config()
-            base_url = config.get("metrics_url", "http://localhost:8428")
-            self._client = MetricsClient(base_url)
+            return ExecuteResponse(
+                output={"error": "metrics_url not configured — set MIRASTACK_METRICS_URL or push config via engine"},
+                logs=["ERROR: no metrics client configured"],
+            )
 
         action = req.params.get("action", "")
         try:
-            result = await self._dispatch(action, req.params)
-            return ExecutionResponse(
+            result = await self._dispatch(action, req.params, req.time_range)
+            return ExecuteResponse(
                 output={"result": json.dumps(result, default=str)},
             )
         except Exception as e:
-            return ExecutionResponse(
+            return ExecuteResponse(
                 output={"error": str(e)},
-                error=str(e),
+                logs=[f"ERROR: {e}"],
             )
 
-    async def _dispatch(self, action: str, params: dict) -> dict | list:
+    async def _dispatch(self, action: str, params: dict, tr: TimeRange | None = None) -> dict | list:
         match action:
             case "instant_query":
+                eval_time = params.get("time")
+                if tr and tr.end_epoch_ms > 0:
+                    eval_time = format_epoch_seconds(tr.end_epoch_ms)
                 return await self._client.instant_query(
-                    params["query"], params.get("time")
+                    params["query"], eval_time
                 )
             case "range_query":
+                if tr and tr.start_epoch_ms > 0:
+                    start = format_epoch_seconds(tr.start_epoch_ms)
+                    end = format_epoch_seconds(tr.end_epoch_ms)
+                else:
+                    start = params["start"]
+                    end = params["end"]
                 return await self._client.range_query(
-                    params["query"], params["start"], params["end"], params["step"]
+                    params["query"], start, end, params["step"]
                 )
             case "label_names":
                 return await self._client.label_names()
@@ -91,24 +114,37 @@ class QueryMetricsPlugin(Plugin):
                 return await self._client.label_values(params["label"])
             case "series":
                 match_selectors = [m.strip() for m in params.get("match", "").split(",")]
+                if tr and tr.start_epoch_ms > 0:
+                    start = format_epoch_seconds(tr.start_epoch_ms)
+                    end = format_epoch_seconds(tr.end_epoch_ms)
+                else:
+                    start = params["start"]
+                    end = params["end"]
                 return await self._client.series(
-                    match_selectors, params["start"], params["end"]
+                    match_selectors, start, end
                 )
             case "metadata":
                 return await self._client.metadata(params.get("metric"))
             case _:
                 raise ValueError(f"Unknown action: {action}")
 
-    async def health_check(self) -> bool:
+    async def health_check(self) -> None:
+        # Pull config from engine (cached 15s in SDK)
+        ec = getattr(self, "_engine_context", None)
+        if ec is not None:
+            try:
+                config = await ec.get_config()
+                await self._apply_config(config)
+            except Exception:
+                pass
         if self._client is None:
-            return False
-        try:
-            await self._client.label_names()
-            return True
-        except Exception:
-            return False
+            raise RuntimeError("metrics_url not configured")
+        await self._client.label_names()
 
-    async def config_updated(self, config: dict):
+    async def config_updated(self, config: dict[str, str]) -> None:
+        await self._apply_config(config)
+
+    async def _apply_config(self, config: dict[str, str]) -> None:
         if "metrics_url" in config:
             if self._client:
                 await self._client.close()
@@ -117,7 +153,7 @@ class QueryMetricsPlugin(Plugin):
 
 def main():
     plugin = QueryMetricsPlugin()
-    asyncio.run(serve(plugin))
+    serve(plugin)
 
 
 if __name__ == "__main__":
