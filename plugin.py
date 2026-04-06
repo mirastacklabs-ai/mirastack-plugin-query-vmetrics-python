@@ -6,6 +6,7 @@ import json
 import os
 
 from mirastack_sdk import (
+    Action,
     ConfigParam,
     Plugin,
     PluginInfo,
@@ -15,6 +16,8 @@ from mirastack_sdk import (
     DevOpsStage,
     ExecuteRequest,
     ExecuteResponse,
+    respond_map,
+    respond_error,
     serve,
 )
 from mirastack_sdk.datetimeutils import format_epoch_seconds
@@ -39,55 +42,95 @@ class QueryMetricsPlugin(Plugin):
             description="Query Prometheus/VictoriaMetrics for metrics data",
             permissions=[Permission.READ],
             devops_stages=[DevOpsStage.OBSERVE],
+            actions=[
+                Action(
+                    id="instant_query",
+                    description="Execute an instant PromQL query at a single point in time",
+                    permission=Permission.READ,
+                    stages=[DevOpsStage.OBSERVE],
+                    input_params=[
+                        ParamSchema(name="query", type="string", required=True, description="PromQL query expression"),
+                        ParamSchema(name="time", type="string", required=False, description="Evaluation time (default: now)"),
+                    ],
+                    output_params=[ParamSchema(name="result", type="json", required=True, description="Instant query result")],
+                ),
+                Action(
+                    id="range_query",
+                    description="Execute a PromQL range query over a time window",
+                    permission=Permission.READ,
+                    stages=[DevOpsStage.OBSERVE],
+                    input_params=[
+                        ParamSchema(name="query", type="string", required=True, description="PromQL query expression"),
+                        ParamSchema(name="start", type="string", required=False, description="Start time"),
+                        ParamSchema(name="end", type="string", required=False, description="End time"),
+                        ParamSchema(name="step", type="string", required=True, description="Query step (e.g., 15s, 1m)"),
+                    ],
+                    output_params=[ParamSchema(name="result", type="json", required=True, description="Range query result")],
+                ),
+                Action(
+                    id="label_names",
+                    description="List all label names in the metrics store",
+                    permission=Permission.READ,
+                    stages=[DevOpsStage.OBSERVE],
+                    output_params=[ParamSchema(name="result", type="json", required=True, description="Label names")],
+                ),
+                Action(
+                    id="label_values",
+                    description="List values for a specific label",
+                    permission=Permission.READ,
+                    stages=[DevOpsStage.OBSERVE],
+                    input_params=[
+                        ParamSchema(name="label", type="string", required=True, description="Label name"),
+                    ],
+                    output_params=[ParamSchema(name="result", type="json", required=True, description="Label values")],
+                ),
+                Action(
+                    id="series",
+                    description="Find time series matching selectors",
+                    permission=Permission.READ,
+                    stages=[DevOpsStage.OBSERVE],
+                    input_params=[
+                        ParamSchema(name="match", type="string", required=True, description="Series selector (comma-separated)"),
+                        ParamSchema(name="start", type="string", required=False, description="Start time"),
+                        ParamSchema(name="end", type="string", required=False, description="End time"),
+                    ],
+                    output_params=[ParamSchema(name="result", type="json", required=True, description="Matching series")],
+                ),
+                Action(
+                    id="metadata",
+                    description="Get metric metadata (type, help, unit)",
+                    permission=Permission.READ,
+                    stages=[DevOpsStage.OBSERVE],
+                    input_params=[
+                        ParamSchema(name="metric", type="string", required=False, description="Metric name (omit for all)"),
+                    ],
+                    output_params=[ParamSchema(name="result", type="json", required=True, description="Metric metadata")],
+                ),
+            ],
             config_params=[
                 ConfigParam(key="metrics_url", type="string", required=True, description="VictoriaMetrics base URL (e.g. http://victoriametrics:8428)"),
             ],
         )
 
     def schema(self) -> PluginSchema:
-        return PluginSchema(
-            input_params=[
-                ParamSchema(name="action", type="string", required=True,
-                            description="One of: instant_query, range_query, label_names, label_values, series, metadata"),
-                ParamSchema(name="query", type="string", required=False,
-                            description="PromQL query expression"),
-                ParamSchema(name="start", type="string", required=False,
-                            description="Start time (RFC3339 or relative like -1h)"),
-                ParamSchema(name="end", type="string", required=False,
-                            description="End time (RFC3339 or relative like now)"),
-                ParamSchema(name="step", type="string", required=False,
-                            description="Query step (e.g., 15s, 1m)"),
-                ParamSchema(name="label", type="string", required=False,
-                            description="Label name for label_values action"),
-                ParamSchema(name="match", type="string", required=False,
-                            description="Series selector for series action"),
-                ParamSchema(name="metric", type="string", required=False,
-                            description="Metric name for metadata action"),
-            ],
-            output_params=[
-                ParamSchema(name="result", type="json", required=True,
-                            description="Query result as JSON"),
-            ],
-        )
+        info = self.info()
+        return PluginSchema(actions=info.actions)
 
     async def execute(self, req: ExecuteRequest) -> ExecuteResponse:
         if self._client is None:
-            return ExecuteResponse(
-                output={"error": "metrics_url not configured — set MIRASTACK_METRICS_URL or push config via engine"},
-                logs=["ERROR: no metrics client configured"],
-            )
+            resp = respond_error("metrics_url not configured — set MIRASTACK_METRICS_URL or push config via engine")
+            resp.logs = ["ERROR: no metrics client configured"]
+            return resp
 
-        action = req.params.get("action", "")
+        action = req.action_id or req.params.get("action", "")
         try:
             result = await self._dispatch(action, req.params, req.time_range)
-            return ExecuteResponse(
-                output={"result": json.dumps(result, default=str)},
-            )
+            resp = respond_map({"result": result})
+            return resp
         except Exception as e:
-            return ExecuteResponse(
-                output={"error": str(e)},
-                logs=[f"ERROR: {e}"],
-            )
+            resp = respond_error(str(e))
+            resp.logs = [f"ERROR: {e}"]
+            return resp
 
     async def _dispatch(self, action: str, params: dict, tr: TimeRange | None = None) -> dict | list:
         match action:
