@@ -20,17 +20,17 @@ class TestEnrichMetricsOutput(unittest.TestCase):
             "data": {"resultType": "vector", "result": [{"metric": {}, "value": [1, "1"]}]},
         })
         out = enrich_metrics_output("instant_query", raw)
-        self.assertEqual(out["result_count"], 1)
+        self.assertEqual(out["result_count"], "1")
 
     def test_result_count_from_array(self):
         raw = json.dumps({"status": "success", "data": ["__name__", "job"]})
         out = enrich_metrics_output("label_names", raw)
-        self.assertEqual(out["result_count"], 2)
+        self.assertEqual(out["result_count"], "2")
 
     def test_truncation(self):
         long = "x" * (MAX_RESULT_LEN + 5000)
         out = enrich_metrics_output("range_query", long)
-        self.assertTrue(out["truncated"])
+        self.assertEqual(out["truncated"], "true")
         self.assertEqual(len(out["result"]), MAX_RESULT_LEN)
 
     def test_invalid_json_passes_through(self):
@@ -42,7 +42,7 @@ class TestEnrichMetricsOutput(unittest.TestCase):
     def test_dict_input(self):
         data = {"status": "success", "data": {"result": [1, 2, 3]}}
         out = enrich_metrics_output("instant_query", data)
-        self.assertEqual(out["result_count"], 3)
+        self.assertEqual(out["result_count"], "3")
 
 
 if __name__ == "__main__":
